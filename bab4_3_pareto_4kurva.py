@@ -28,6 +28,10 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
 
 # =============================================================================
@@ -143,6 +147,176 @@ def pareto_indices(xs, ys, maximize_x=False):
     return front
 
 
+def catmull_rom_spline(xs, ys, samples_per_segment=40):
+    """Buat garis halus sederhana tanpa dependensi SciPy."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+
+    if len(xs) < 3:
+        return xs, ys
+
+    x_pad = np.concatenate(([xs[0]], xs, [xs[-1]]))
+    y_pad = np.concatenate(([ys[0]], ys, [ys[-1]]))
+    x_smooth = []
+    y_smooth = []
+
+    for i in range(1, len(x_pad) - 2):
+        p0 = np.array([x_pad[i - 1], y_pad[i - 1]])
+        p1 = np.array([x_pad[i], y_pad[i]])
+        p2 = np.array([x_pad[i + 1], y_pad[i + 1]])
+        p3 = np.array([x_pad[i + 2], y_pad[i + 2]])
+
+        for t in np.linspace(0, 1, samples_per_segment, endpoint=False):
+            t2 = t * t
+            t3 = t2 * t
+            point = 0.5 * (
+                (2 * p1) +
+                (-p0 + p2) * t +
+                (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+                (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+            )
+            x_smooth.append(point[0])
+            y_smooth.append(point[1])
+
+    x_smooth.append(xs[-1])
+    y_smooth.append(ys[-1])
+    return np.asarray(x_smooth), np.asarray(y_smooth)
+
+
+def compute_label_yshifts(y_values, y_range_layout, usable_height_px, min_gap_px=22):
+    """Atur jarak label vertikal dalam pixel agar tidak saling bertumpuk."""
+    y_values = np.asarray(y_values, dtype=float)
+    y_min, y_max = min(y_range_layout), max(y_range_layout)
+    denom = max(y_max - y_min, 1e-9)
+
+    base_positions = (y_values - y_min) / denom * usable_height_px
+    order = np.argsort(base_positions)
+    adjusted = base_positions.copy()
+
+    for idx in range(1, len(order)):
+        cur = order[idx]
+        prev = order[idx - 1]
+        adjusted[cur] = max(adjusted[cur], adjusted[prev] + min_gap_px)
+
+    overflow = adjusted[order[-1]] - usable_height_px
+    if overflow > 0:
+        adjusted -= overflow
+
+    underflow = adjusted[order[0]]
+    if underflow < 0:
+        adjusted -= underflow
+
+    return adjusted - base_positions
+
+
+def compute_label_positions(xs, ys, x_range_layout, y_range_layout, reverse_x=False):
+    """Hitung posisi label yang tetap dekat dengan titik tetapi tidak saling bertumpuk."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+
+    x_left = min(x_range_layout)
+    x_right = max(x_range_layout)
+    y_bottom = min(y_range_layout)
+    y_top = max(y_range_layout)
+    x_span = max(x_right - x_left, 1e-9)
+    y_span = max(y_top - y_bottom, 1e-9)
+
+    y_gap = max(y_span * 0.055, 0.0018)
+    order = np.argsort(ys)
+    label_ys = ys.copy()
+
+    for idx in range(1, len(order)):
+        cur = order[idx]
+        prev = order[idx - 1]
+        label_ys[cur] = max(label_ys[cur], label_ys[prev] + y_gap)
+
+    overflow = label_ys[order[-1]] - (y_top - y_gap * 0.25)
+    if overflow > 0:
+        label_ys -= overflow
+
+    underflow = (y_bottom + y_gap * 0.25) - label_ys[order[0]]
+    if underflow > 0:
+        label_ys += underflow
+
+    x_offset = x_span * 0.018
+    if reverse_x:
+        label_xs = xs - x_offset
+    else:
+        label_xs = xs + x_offset
+
+    return label_xs, label_ys
+
+
+def export_static_png_fallback(plot_df, front_df, x_col, y_col, x_label, y_label,
+                               title, x_range_layout, y_range_layout, out_png,
+                               color_pareto, color_non_pareto, label_yshifts,
+                               y_tickvals, x_fmt):
+    """Fallback PNG statis jika export Plotly gagal di environment lokal."""
+    fig, ax = plt.subplots(figsize=(9.4, 8.2), dpi=200)
+    smooth_x, smooth_y = catmull_rom_spline(front_df[x_col], front_df[y_col])
+
+    ax.plot(
+        smooth_x,
+        smooth_y,
+        color=color_pareto,
+        linewidth=2.2,
+        linestyle='--',
+        zorder=2
+    )
+
+    for idx, row in plot_df.iterrows():
+        marker_color = color_pareto if row['IsPareto'] else color_non_pareto
+        ax.vlines(
+            row[x_col], y_range_layout[0], row[y_col],
+            colors='#D6DEEF', linestyles='--', linewidth=0.9, zorder=1
+        )
+        ax.hlines(
+            row[y_col], x_range_layout[0], row[x_col],
+            colors='#D6DEEF', linestyles='--', linewidth=0.9, zorder=1
+        )
+        ax.scatter(
+            row[x_col],
+            row[y_col],
+            s=95,
+            color=marker_color,
+            edgecolors='none',
+            zorder=3
+        )
+        ax.annotate(
+            row['DisplayLabel'],
+            (row[x_col], row[y_col]),
+            xytext=(10, float(label_yshifts[idx]) * 0.55),
+            textcoords='offset points',
+            ha='left',
+            va='center',
+            fontsize=10,
+            color='#444444',
+            zorder=4
+        )
+
+    ax.set_title(title, fontsize=14, color='#222222', pad=14)
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel(y_label, fontsize=11)
+    ax.set_xlim(x_range_layout[0], x_range_layout[1])
+    ax.set_ylim(y_range_layout[0], y_range_layout[1])
+    ax.set_yticks(y_tickvals)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+    ax.xaxis.set_major_formatter(FormatStrFormatter(x_fmt.replace(':', '%')))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.4f'))
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#AAAAAA')
+    ax.spines['bottom'].set_color('#AAAAAA')
+    ax.tick_params(axis='both', colors='#555555', labelsize=10)
+    ax.grid(True, which='major', axis='y', linestyle='--', linewidth=0.8, color='#D9DFEA')
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+    plt.tight_layout()
+    fig.savefig(out_png, bbox_inches='tight')
+    plt.close(fig)
+
+
 def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
                        reverse_x=False, x_fmt=':.4f',
                        maximize_x=False, fname_prefix='pareto',
@@ -183,11 +357,8 @@ def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
         marker_color = color_pareto if row['IsPareto'] else color_non_pareto
         fig.add_trace(go.Scatter(
             x=[row[x_col]], y=[row[y_col]],
-            mode='markers+text',
+            mode='markers',
             marker=dict(size=14, color=marker_color, line=dict(width=0)),
-            text=[f"  {row['DisplayLabel']}"],
-            textposition='middle right',
-            textfont=dict(size=12, color='#444444', family='Arial'),
             name=row['DisplayLabel'],
             customdata=[[row['VRAM_GB'], row['Latency_s'],
                          row['TTFT_s'], row['Throughput_tps']]],
@@ -213,12 +384,12 @@ def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
         x_range = abs(x_data_max) * 0.1 + 1.0
 
     if reverse_x:
-        plot_x_max = x_data_max + x_range * 0.10
-        plot_x_min = x_data_min - x_range * 0.55
+        plot_x_max = x_data_max + x_range * 0.06
+        plot_x_min = x_data_min - x_range * 0.12
         x_range_layout = [plot_x_max, plot_x_min]
     else:
-        plot_x_max = x_data_max + x_range * 0.55
-        plot_x_min = x_data_min - x_range * 0.10
+        plot_x_max = x_data_max + x_range * 0.12
+        plot_x_min = x_data_min - x_range * 0.06
         x_range_layout = [plot_x_min, plot_x_max]
 
     # Padding sumbu Y
@@ -227,6 +398,47 @@ def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
     y_range = y_data_max - y_data_min
     if y_range == 0:
         y_range = abs(y_data_max) * 0.1 + 0.01
+
+    # Perketat skala Y agar perbedaan NDCG lebih terbaca.
+    y_padding = max(y_range * 0.028, 0.0022)
+    y_range_layout = [y_data_min - y_padding, y_data_max + y_padding]
+    y_tickvals = np.sort(plot_df[y_col].unique())
+    label_yshifts = compute_label_yshifts(
+        plot_df[y_col].values,
+        y_range_layout=y_range_layout,
+        usable_height_px=500,
+        min_gap_px=14
+    )
+
+    for idx, row in plot_df.iterrows():
+        fig.add_shape(
+            type='line',
+            x0=row[x_col], y0=y_range_layout[0],
+            x1=row[x_col], y1=row[y_col],
+            line=dict(color='#D6DEEF', width=1, dash='dot'),
+            layer='below'
+        )
+        fig.add_shape(
+            type='line',
+            x0=x_range_layout[0], y0=row[y_col],
+            x1=row[x_col], y1=row[y_col],
+            line=dict(color='#D6DEEF', width=1, dash='dot'),
+            layer='below'
+        )
+        fig.add_annotation(
+            x=row[x_col],
+            y=row[y_col],
+            text=row['DisplayLabel'],
+            xref='x',
+            yref='y',
+            showarrow=False,
+            xanchor='left',
+            yanchor='middle',
+            xshift=12,
+            yshift=float(label_yshifts[idx]),
+            font=dict(size=12, color='#444444', family='Arial'),
+            align='left'
+        )
 
     fig.update_layout(
         title=dict(
@@ -237,22 +449,29 @@ def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
         xaxis=dict(
             title=x_label,
             range=x_range_layout,
-            showgrid=False, zeroline=False,
+            tickformat=x_fmt[1:],
+            nticks=6,
+            showgrid=False,
+            zeroline=False,
             showline=True, linecolor='#AAAAAA', linewidth=1,
-            ticks='outside', tickcolor='#AAAAAA'
+            ticks='outside', tickcolor='#AAAAAA',
+            automargin=True
         ),
         yaxis=dict(
             title=y_label,
-            range=[y_data_min - y_range * 0.20, y_data_max + y_range * 0.20],
-            showgrid=False, zeroline=False,
+            range=y_range_layout,
+            tickvals=y_tickvals.tolist(),
+            showgrid=True, gridcolor='#D9DFEA', griddash='dash', gridwidth=0.8,
+            zeroline=False,
             showline=True, linecolor='#AAAAAA', linewidth=1,
             ticks='outside', tickcolor='#AAAAAA',
-            tickformat='.3f'
+            tickformat='.4f',
+            automargin=True
         ),
         plot_bgcolor='white',
         paper_bgcolor='white',
-        width=900, height=600,
-        margin=dict(l=80, r=180, t=80, b=80),
+        width=920, height=780,
+        margin=dict(l=85, r=190, t=85, b=85),
     )
 
     # Simpan HTML interaktif
@@ -268,6 +487,26 @@ def build_pareto_chart(df, x_col, y_col, x_label, y_label, title,
     except Exception:
         print(f"⚠ PNG export gagal (perlu Chrome/Chromium di sistem)")
         print(f"  Solusi: buka HTML di browser, klik icon kamera di pojok kanan atas")
+
+    if not out_png.exists() or out_png.stat().st_mtime < out_html.stat().st_mtime:
+        export_static_png_fallback(
+            plot_df=plot_df,
+            front_df=front_df_p,
+            x_col=x_col,
+            y_col=y_col,
+            x_label=x_label,
+            y_label=y_label,
+            title=title,
+            x_range_layout=x_range_layout,
+            y_range_layout=y_range_layout,
+            out_png=out_png,
+            color_pareto=color_pareto,
+            color_non_pareto=color_non_pareto,
+            label_yshifts=label_yshifts,
+            y_tickvals=y_tickvals,
+            x_fmt=x_fmt,
+        )
+        print("Fallback PNG matplotlib diperbarui agar sinkron dengan HTML terbaru")
 
     # Print ringkasan Pareto
     print(f"\n  Pareto-optimal:")
